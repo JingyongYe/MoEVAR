@@ -5,6 +5,7 @@ import sys
 import time
 import warnings
 from functools import partial
+from typing import Tuple, List, Dict, Union  # Add typing imports
 
 import torch
 from torch.utils.data import DataLoader
@@ -14,11 +15,68 @@ from utils import arg_util, misc
 from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
+from moe import apply_moe_to_var, print_trainable_parameters
 
+def filter_params_allow_frozen(model, nowd_keys=()) -> Tuple[
+    List[str], List[torch.nn.Parameter], List[Dict[str, Union[torch.nn.Parameter, float]]]
+]:
+    """Modified version of filter_params that allows frozen parameters."""
+    from pprint import pformat
+    import dist
+    
+    para_groups, para_groups_dbg = {}, {}
+    names, paras = [], []
+    names_no_grad = []
+    count, numel = 0, 0
+    for name, para in model.named_parameters():
+        name = name.replace('_fsdp_wrapped_module.', '')
+        if not para.requires_grad:
+            names_no_grad.append(name)
+            continue  # frozen weights
+        count += 1
+        numel += para.numel()
+        names.append(name)
+        paras.append(para)
+        
+        if para.ndim == 1 or name.endswith('bias') or any(k in name for k in nowd_keys):
+            cur_wd_sc, group_name = 0., 'ND'
+        else:
+            cur_wd_sc, group_name = 1., 'D'
+        cur_lr_sc = 1.
+        if group_name not in para_groups:
+            para_groups[group_name] = {'params': [], 'wd_sc': cur_wd_sc, 'lr_sc': cur_lr_sc}
+            para_groups_dbg[group_name] = {'params': [], 'wd_sc': cur_wd_sc, 'lr_sc': cur_lr_sc}
+        para_groups[group_name]['params'].append(para)
+        para_groups_dbg[group_name]['params'].append(name)
+    
+    for g in para_groups_dbg.values():
+        g['params'] = pformat(', '.join(g['params']), width=200)
+    
+    print(f'[get_param_groups] param_groups = \n{pformat(para_groups_dbg, indent=2, width=240)}\n')
+    
+    for rk in range(dist.get_world_size()):
+        dist.barrier()
+        if dist.get_rank() == rk:
+            print(f'[get_param_groups][rank{dist.get_rank()}] {type(model).__name__=} {count=}, {numel=}', flush=True, force=True)
+    print('')
+    
+    if names_no_grad:
+        print(f'[get_param_groups] Found {len(names_no_grad)} frozen parameters. This is expected for MoE fine-tuning.')
+        print(f'[get_param_groups] First few frozen parameters: {names_no_grad[:5]}')
+    
+    return names, paras, list(para_groups.values())
 
 def build_everything(args: arg_util.Args):
-    # resume
+    # Import MoE module
+    
+    
+    
+    # Try to resume from MoE checkpoint first
     auto_resume_info, start_ep, start_it, trainer_state, args_state = auto_resume(args, 'moevar-ckpt*.pth')
+    
+    # Check if we're resuming from MoE checkpoint
+    is_moe_resume = start_ep > 0
+    
     # create tensorboard logger
     tb_lg: misc.TensorboardLogger
     with_tb_lg = dist.is_master()
@@ -97,22 +155,67 @@ def build_everything(args: arg_util.Args):
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
     
+    # Load VAR checkpoint if not resuming from MoE
+    if not is_moe_resume and hasattr(args, 'var_ckpt_path') and args.var_ckpt_path:
+        print(f"[MoE] Loading VAR checkpoint from {args.var_ckpt_path}")
+        var_ckpt_state = torch.load(args.var_ckpt_path, map_location='cpu')
+        if 'trainer' in var_ckpt_state:
+            # This is from our training format
+            var_wo_ddp.load_state_dict(var_ckpt_state['trainer']['var_wo_ddp'], strict=True)
+        else:
+            # Direct model state dict
+            var_wo_ddp.load_state_dict(var_ckpt_state, strict=True)
+        print(f"[MoE] VAR checkpoint loaded successfully")
+    
+    # Apply MoE transformation if not resuming from MoE checkpoint
+    if not is_moe_resume:
+        print(f"[MoE] Applying MoE transformation:")
+        # Convert string arguments to appropriate types
+        moe_layer = int(args.moe_layer) if isinstance(args.moe_layer, str) else args.moe_layer
+        moe_num_experts = int(args.moe_num_experts) if isinstance(args.moe_num_experts, str) else args.moe_num_experts
+        moe_top_k = int(args.moe_top_k) if isinstance(args.moe_top_k, str) else args.moe_top_k
+        moe_router_jitter = float(args.moe_router_jitter) if isinstance(args.moe_router_jitter, str) else args.moe_router_jitter
+        moe_router_temperature = float(args.moe_router_temperature) if isinstance(args.moe_router_temperature, str) else args.moe_router_temperature
+        
+        print(f"      - Target layer: {moe_layer}")
+        print(f"      - Num experts: {moe_num_experts}")
+        print(f"      - Top-k: {moe_top_k}")
+        print(f"      - Router type: {args.moe_router_type}")
+        
+        var_wo_ddp = apply_moe_to_var(
+            var_wo_ddp, 
+            layer_index=moe_layer,
+            num_experts=moe_num_experts,
+            top_k=moe_top_k,
+            router_type=args.moe_router_type,
+            router_jitter=moe_router_jitter,
+            router_temperature=moe_router_temperature
+        )
+        print("[MoE] Model modified successfully")
+        print_trainable_parameters(var_wo_ddp)
+        
+        # Create a wrapper that only exposes trainable parameters
+        trainable_var_wo_ddp = var_wo_ddp
+    else:
+        trainable_var_wo_ddp = var_wo_ddp
+    
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
-    var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
+    var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=True, broadcast_buffers=False)
     
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAE', vae_local), ('VAE.enc', vae_local.encoder), ('VAE.dec', vae_local.decoder), ('VAE.quant', vae_local.quantize))]))
     print(f'[INIT][#para] ' + ', '.join([f'{k}={count_p(m)}' for k, m in (('VAR', var_wo_ddp),)]) + '\n\n')
     
-    # build optimizer
-    names, paras, para_groups = filter_params(var_wo_ddp, nowd_keys={
+    # build optimizer using only trainable parameters
+    names, paras, para_groups = filter_params_allow_frozen(trainable_var_wo_ddp, nowd_keys={
         'cls_token', 'start_token', 'task_token', 'cfg_uncond',
         'pos_embed', 'pos_1LC', 'pos_start', 'start_pos', 'lvl_embed',
         'gamma', 'beta',
         'ada_gss', 'moe_bias',
         'scale_mul',
+        'router',  # Add router weights to no weight decay
     })
     opt_clz = {
         'adam':  partial(torch.optim.AdamW, betas=(0.9, 0.95), fused=args.afuse),
@@ -169,6 +272,15 @@ def build_everything(args: arg_util.Args):
 
 
 def main_training():
+    # Add MoE arguments to args
+    arg_util.Args.var_ckpt_path = ""
+    arg_util.Args.moe_layer = -1  # Last layer by default
+    arg_util.Args.moe_num_experts = 8
+    arg_util.Args.moe_top_k = 2
+    arg_util.Args.moe_router_type = "softmax"  # or "noisy_gate"
+    arg_util.Args.moe_router_jitter = 0.01
+    arg_util.Args.moe_router_temperature = 1.0
+    
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
