@@ -176,13 +176,19 @@ class VARTrainer(object):
                 # Theoretical loss computation (only on sampled iterations)
                 theory_loss = 0.0
                 if collect_activations and len(scale_reps) > 0:
-                    # Create a fake multi-scale representation for initial testing
-                    # In real use, you'd collect representations across different scales
-                    if len(scale_reps) >= 2:  # Add this check
-                        theory_loss, lyapunov, holder, jacobi = compute_theoretical_losses(scale_reps)
+                    if len(scale_reps) >= 2:  # Only compute with multiple scale representations
+                        try:
+                            theory_loss, lyapunov, holder, jacobi = compute_theoretical_losses(scale_reps)
+                            # Guard against NaN values
+                            if torch.isnan(theory_loss):
+                                theory_loss = torch.tensor(0.0, device=x_BLCv_wo_first_l.device)
+                                lyapunov = holder = jacobi = 0.0
+                        except Exception as e:
+                            print(f"Warning: Error computing theoretical losses: {e}")
+                            theory_loss = torch.tensor(0.0, device=x_BLCv_wo_first_l.device)
+                            lyapunov = holder = jacobi = 0.0
                     else:
-                        # Skip theoretical loss calculation or not enough representations
-                        theory_loss = torch.tensor(0.0, device=x_BLCv_wo_first_l.device)  # Use a safe device reference
+                        theory_loss = torch.tensor(0.0, device=x_BLCv_wo_first_l.device)
                         lyapunov = holder = jacobi = 0.0
                     
                     # Add to total loss with small weight

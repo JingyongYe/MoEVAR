@@ -18,6 +18,5 @@ local_output*
 *.log
 *.txt
 *.ipynb
-/training/var_d16_256
 /output/
 /datasets/
