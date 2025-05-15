@@ -103,7 +103,7 @@ def build_everything(args: arg_util.Args):
         types = str((type(dataset_train).__name__, type(dataset_val).__name__))
         
         ld_val = DataLoader(
-            dataset_val, num_workers=0, pin_memory=True,
+            dataset_val, num_workers=max(4, args.workers // 2), pin_memory=True,
             batch_size=round(args.batch_size*1.5), sampler=EvalDistributedSampler(dataset_val, num_replicas=dist.get_world_size(), rank=dist.get_rank()),
             shuffle=False, drop_last=False,
         )
