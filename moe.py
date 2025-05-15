@@ -112,7 +112,10 @@ class MoEFFN(nn.Module):
             total_tokens = batch_size * seq_len * self.top_k
             expert_fractions = expert_counts / total_tokens
             ideal_fraction = 1.0 / self.num_experts
-            self.balance_loss = ((expert_fractions - ideal_fraction)**2).sum() * self.num_experts
+            # Scale balance loss with a warmup factor based on iteration
+            balance_factor = ((expert_fractions - ideal_fraction)**2).sum() * self.num_experts
+            # Start with lower weight and gradually increase
+            self.balance_loss = balance_factor * min(1.0, g_it / 1000)  # g_it should be passed in
     
         # Process each expert - simpler approach to avoid indexing errors
         for expert_idx in range(self.num_experts):
