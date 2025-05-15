@@ -13,10 +13,10 @@ def lr_wd_annealing(sche_type: str, optimizer, peak_lr, wd, wd_end, cur_it, wp_i
     
     if cur_it < wp_it:
         # 修改此处以直接使用较高的学习率启动
-        # 原代码: cur_lr = wp0 + (1-wp0) * cur_it / wp_it
+        cur_lr = wp0 + (1-wp0) * cur_it / wp_it
         
         # 方案1: 直接以峰值学习率开始，完全不需要预热
-        cur_lr = 1.0
+        #cur_lr = 1.0
         
         # 方案2(备选): 使用非常快的学习率预热，几个iteration就达到接近峰值
         # cur_lr = 0.9 + 0.1 * cur_it / min(wp_it, 10)

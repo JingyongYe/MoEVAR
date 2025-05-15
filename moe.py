@@ -101,53 +101,30 @@ class MoEFFN(nn.Module):
         
         # Track expert counts for load balancing
         if self.training:
-            # Compute expert assignment distribution for load balancing
-            expert_mask = torch.zeros(batch_size * seq_len, self.num_experts, device=x.device)
+            # Calculate usage statistics (simplified to avoid numerical issues)
+            expert_counts = torch.zeros(self.num_experts, device=x.device)
             for k in range(self.top_k):
-                flat_indices = routing_indices[:, :, k].reshape(-1)
-                expert_mask.scatter_add_(
-                    1, 
-                    flat_indices.unsqueeze(-1),
-                    routing_weights[:, :, k].reshape(-1, 1)
-                )
+                for expert_idx in range(self.num_experts):
+                    # Count how many tokens are routed to each expert
+                    expert_counts[expert_idx] += (routing_indices[:, :, k] == expert_idx).sum().float()
             
-            # Calculate load
-            expert_load = expert_mask.mean(0)
-            
-            # Compute balance loss (simplified and efficient)
-            # Penalize deviation from uniform distribution
-            balance_factor = (expert_load - 1.0/self.num_experts).pow(2).sum() * self.num_experts
-            self.balance_loss = balance_factor
-        
-        # More efficient implementation - only process tokens routed to each expert
+            # Calculate load balancing loss - ensure no division by zero
+            total_tokens = batch_size * seq_len * self.top_k
+            expert_fractions = expert_counts / total_tokens
+            ideal_fraction = 1.0 / self.num_experts
+            self.balance_loss = ((expert_fractions - ideal_fraction)**2).sum() * self.num_experts
+    
+        # Process each expert - simpler approach to avoid indexing errors
         for expert_idx in range(self.num_experts):
-            # Find which tokens are routed to this expert at any k position
-            expert_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=x.device)
-            expert_scale = torch.zeros((batch_size, seq_len, 1), device=x.device)
+            # Process all inputs through this expert
+            expert_output = self.experts[expert_idx](x)
             
+            # Only keep outputs for tokens that use this expert
             for k in range(self.top_k):
-                # Find locations where this expert is selected
-                selected_locations = (routing_indices[:, :, k] == expert_idx)
-                expert_mask = expert_mask | selected_locations
-                expert_scale += selected_locations.unsqueeze(-1) * routing_weights[:, :, k].unsqueeze(-1)
-            
-            # Skip if no tokens are routed to this expert
-            if not expert_mask.any():
-                continue
-                
-            # Only process tokens that use this expert
-            selected_indices = expert_mask.nonzero(as_tuple=True)
-            selected_batch_indices, selected_seq_indices = selected_indices
-            
-            # Get the input tokens for this expert
-            expert_input = x[selected_batch_indices, selected_seq_indices]
-            
-            # Process with expert
-            expert_output = self.experts[expert_idx](expert_input)
-            
-            # Place outputs back in the right positions with proper scaling
-            outputs[selected_batch_indices, selected_seq_indices] += expert_output * expert_scale[expert_mask]
-        
+                mask = (routing_indices[:, :, k] == expert_idx).unsqueeze(-1)
+                scale = routing_weights[:, :, k].unsqueeze(-1)
+                outputs = outputs + mask * scale * expert_output
+    
         return outputs
 
     def extra_repr(self) -> str:
