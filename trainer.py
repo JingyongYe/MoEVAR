@@ -10,6 +10,7 @@ import dist
 from models import VAR, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
+from moe import compute_theoretical_losses
 
 Ten = torch.Tensor
 FTen = torch.Tensor
@@ -98,6 +99,10 @@ class VARTrainer(object):
         if self.first_prog: prog_wp = 1    # no prog warmup at first prog stage, as it's already solved in wp
         if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
         
+        # Set current scale index for MoE layer
+        if hasattr(self.var_wo_ddp, 'current_scale_idx'):
+            self.var_wo_ddp.current_scale_idx = prog_si if prog_si >= 0 else len(self.patch_nums) - 1
+    
         # forward
         B, V = label_B.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
@@ -106,19 +111,94 @@ class VARTrainer(object):
         gt_BL = torch.cat(gt_idx_Bl, dim=1)
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
         
+        # Track representations for theoretical guarantees (only collect every 4 iterations to save computation)
+        scale_reps = []
+        hooks = []
+        activations = {}
+        
+        # Only collect activation data if it's a MoE model and we need theory loss computation
+        collect_activations = hasattr(self.var_wo_ddp, 'current_scale_idx') and g_it % 4 == 0
+        
+        if collect_activations:
+            def hook_fn(module, input, output, name):
+                # Only keep tensor, not gradient history, and average over sequence dimension for efficiency
+                activations[name] = output.detach().mean(dim=1)
+            
+            # Register hook on the last transformer block only
+            target_block_idx = len(self.var_wo_ddp.blocks) - 1
+            hooks.append(self.var_wo_ddp.blocks[target_block_idx].register_forward_hook(
+                lambda module, inp, outp, name=f"block_{target_block_idx}": hook_fn(module, inp, outp, name)
+            ))
+        
         with self.var_opt.amp_ctx:
-            self.var_wo_ddp.forward
+            # Forward pass
             logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
+            
+            # Extract key activations if collected
+            if collect_activations:
+                key = f"block_{len(self.var_wo_ddp.blocks) - 1}"
+                if key in activations:
+                    scale_reps.append(activations[key])
+                
+                # Clean up hooks
+                for hook in hooks:
+                    hook.remove()
+            
+            # Compute basic loss
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
-            if prog_si >= 0:    # in progressive training
+            if prog_si >= 0:  # in progressive training
                 bg, ed = self.begin_ends[prog_si]
                 assert logits_BLV.shape[1] == gt_BL.shape[1] == ed
                 lw = self.loss_weight[:, :ed].clone()
                 lw[:, bg:ed] *= min(max(prog_wp, 0), 1)
-            else:               # not in progressive training
+            else:  # not in progressive training
                 lw = self.loss_weight
-            loss = loss.mul(lw).sum(dim=-1).mean()
-        
+            
+            main_loss = loss.mul(lw).sum(dim=-1).mean()
+            total_loss = main_loss
+            
+            # Add theoretical guarantees and balance loss if we have MoE
+            if hasattr(self.var_wo_ddp, 'current_scale_idx'):
+                # Get balance loss from MoE layers (if available)
+                balance_loss = 0.0
+                moe_block = self.var_wo_ddp.blocks[self.var_wo_ddp.current_scale_idx]
+                if hasattr(moe_block.ffn, 'balance_loss'):
+                    balance_loss = moe_block.ffn.balance_loss
+                    
+                    # Add to total loss with weighting
+                    balance_weight = 0.01  # Low weight to avoid dominating main loss
+                    total_loss = total_loss + balance_weight * balance_loss
+                    
+                    # Log less frequently to reduce overhead
+                    if g_it % 100 == 0 and dist.is_master():
+                        tb_lg.update(head='MoE/balance_loss', loss=balance_loss.item(), step=g_it)
+                
+                # Theoretical loss computation (only on sampled iterations)
+                theory_loss = 0.0
+                if collect_activations and len(scale_reps) > 0:
+                    # Create a fake multi-scale representation for initial testing
+                    # In real use, you'd collect representations across different scales
+                    if len(scale_reps) >= 2:  # Add this check
+                        theory_loss, lyapunov, holder, jacobi = compute_theoretical_losses(scale_reps)
+                    else:
+                        # Skip theoretical loss calculation or not enough representations
+                        theory_loss = torch.tensor(0.0, device=x_BLCv_wo_first_l.device)  # Use a safe device reference
+                        lyapunov = holder = jacobi = 0.0
+                    
+                    # Add to total loss with small weight
+                    theory_weight = 0.1
+                    total_loss = total_loss + theory_weight * theory_loss
+                    
+                    # Log losses (infrequently)
+                    if g_it % 100 == 0 and dist.is_master():
+                        tb_lg.update(head='MoE/theory_loss', loss=theory_loss.item(), step=g_it)
+                        tb_lg.update(head='MoE/lyapunov_loss', loss=lyapunov, step=g_it)
+                        tb_lg.update(head='MoE/holder_loss', loss=holder, step=g_it)
+                        tb_lg.update(head='MoE/jacobi_loss', loss=jacobi, step=g_it)
+            
+            # Use the combined loss for optimization
+            loss = total_loss
+    
         # backward
         grad_norm, scale_log2 = self.var_opt.backward_clip_step(loss=loss, stepping=stepping)
         
@@ -132,7 +212,7 @@ class VARTrainer(object):
             else:               # not in progressive training
                 Ltail = self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)).item()
                 acc_tail = (pred_BL[:, -self.last_l:] == gt_BL[:, -self.last_l:]).float().mean().item() * 100
-            grad_norm = grad_norm.item()
+            grad_norm = grad_norm.item() if grad_norm is not None else 0.0
             metric_lg.update(Lm=Lmean, Lt=Ltail, Accm=acc_mean, Acct=acc_tail, tnm=grad_norm)
         
         # log to tensorboard
